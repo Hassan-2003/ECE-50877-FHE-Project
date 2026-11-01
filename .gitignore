@@ -1,0 +1,35 @@
+# Toolchain built by Scripts/setup_env.sh (HEIR, OpenFHE, Python venv; ~700 MB)
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+
+# Generated per-run artifacts (HEIR output, Go builds, logs, scratch)
+*.log
+*.so
+*.o
+tmp/
+scratch/
+build/
+
+# Editor / tool state
+.claude/
+.idea/
+.vscode/
+.DS_Store
+
+# Empty placeholder dotfiles the sandbox creates in the working directory
+/.bashrc
+/.bash_profile
+/.profile
+/.zprofile
+/.zshrc
+/.gitconfig
+/.gitmodules
+/.idea
+/.vscode
+/.mcp.json
+/.ripgreprc
