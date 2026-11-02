@@ -1,121 +1,37 @@
 # ECE-50877-FHE-Project
 
-CKKS implementations of DSP kernels (FIR, cross-correlation, FFT, ...) compiled with
-[HEIR](https://github.com/google/heir) to OpenFHE, compared against plaintext
-implementations. See `FHE_Applied_Signal_Processing_Research_Plan.pdf`.
+CKKS (homomorphic encryption) versions of DSP kernels (FIR, cross-correlation, ...),
+compiled with [HEIR](https://github.com/google/heir) to three libraries (OpenFHE and
+Lattigo on the CPU, FIDESlib on an NVIDIA GPU) and compared against plaintext Python.
+See `FHE_Applied_Signal_Processing_Research_Plan.pdf`.
 
 ```
-DSP_Kernels/   <name>_fhe.py  kernel specs (one per kernel) + plaintext implementations
-Scripts/       run_kernel_test.py (runner), mlir_builder.py (kernel builder), setup_env.sh
-Results/       <name>_results.csv written by the runner
+DSP_Kernels/   <name>_fhe.py kernel files (+ the plaintext code they came from)
+Scripts/       setup_env.sh, run_sweep.sh, run_kernel_test.py (runner) and backends
+Results/       <name>_results.csv, written by the sweep
 env/           toolchain built by setup_env.sh (git-ignored)
 ```
 
-## 1. Setup
+## 1. Setup (once)
+
+On a node with internet (e.g. the cluster login node):
 
 ```bash
-bash Scripts/setup_env.sh      # once, ~10-20 min: installs heir-py, builds OpenFHE C++ into env/
-source env/activate.sh         # every session
-export MPLCONFIGDIR=$TMPDIR    # only if ~/.config is read-only
+bash Scripts/setup_env.sh
 ```
 
-OpenFHE is built from source because the host glibc is too old for the PyPI wheel; do not
-`pip install openfhe`. If `go` is on the PATH, setup also prefetches Lattigo (needs
-proxy.golang.org); without it the Lattigo backend is skipped.
+This builds everything into `env/` (about 30-40 min): a Python venv with HEIR, OpenFHE,
+Lattigo, and FIDESlib if CUDA is found. On Purdue Scholar it needs no modules or options.
+On other machines you can set `CUDA_PATH=<cuda root>`, `FIDESLIB_ARCH=<sm list, e.g.
+80-real>` or `SKIP_FIDESLIB=1`.
 
-## 2. Running a kernel test
+## 2. Converting a Python kernel
 
-```bash
-python Scripts/run_kernel_test.py fir                  # all cases, all SIZES, all backends
-python Scripts/run_kernel_test.py fir --backends openfhe   # one library only
-python Scripts/run_kernel_test.py fir --emit-fideslib out/ # write FIDESlib C++, no GPU needed
-python Scripts/run_kernel_test.py fir --sizes 128 256  # override sizes
-python Scripts/run_kernel_test.py fir xcorr            # several kernels
-```
-
-For each (case, size, backend) the runner: computes the plaintext reference, compiles your
-kernel with HEIR (CKKS) to OpenFHE (C++), Lattigo (Go) and FIDESlib (CUDA), encrypts, evaluates, decrypts, then checks
-`max|encrypted - plaintext| <= TOL`. It prints PASS/FAIL, exits non-zero on any failure,
-and writes `Results/<name>_results.csv`:
-
-| column | meaning |
-|---|---|
-| `backend` | `openfhe`, `lattigo` or `fideslib`; one row per backend. CKKS parameters are chosen by HEIR per backend |
-| `plain_time_s`, `fhe_time_s`, `slowdown` | plaintext time, encrypted kernel eval time, ratio (fhe/plain) |
-| `plain_accuracy_pct`, `fhe_accuracy_pct` | 100·(1 − ‖err‖/‖truth‖) vs the float64 plaintext result |
-| `plain_max_err`, `fhe_max_err`, `tol`, `passed` | max abs error vs the float64 result; pass = `fhe_max_err <= tol` |
-| `plain_mem_mb`, `fhe_mem_mb`, `mem_overhead_mb` | plaintext peak Python allocation; FHE memory (OpenFHE: peak RSS growth of the Python process over setup+encrypt+eval; Lattigo: peak RSS of the whole Go process); difference (MB = 2^20 bytes) |
-| `encrypt_pct`, `decrypt_pct` | encryption / decryption time as a percentage of total execution time (`fhe_time_s` + encrypt + decrypt). Compile and key setup are not reported (assumed amortized) |
-| `ops_total`, `op_<backend>_<Name>` | library primitives executed during the kernel, e.g. `op_openfhe_EvalMult`, `op_openfhe_MakeCKKSPackedPlaintext`, `op_lattigo_RotateNew`, `op_lattigo_Encode` (plaintext encodes). OpenFHE counts come from counters in the generated C++; Lattigo counts are static counts of the straight-line generated Go |
-
-Expect ~30-90 s per case at n=128 (HEIR compile dominates).
-
-### FIDESlib (GPU)
-
-HEIR has no FIDESlib backend, so `Scripts/fideslib_emitter.py` translates the OpenFHE C++
-HEIR generates into FIDESlib's OpenFHE-like API (`ModReduce` -> `Rescale`, GPU context
-setup, a timed `main()`), and fails loudly if the kernel uses a primitive FIDESlib lacks.
-`fideslib_backend.py` builds it with CMake and runs it. The backend runs only where an
-NVIDIA GPU, `nvcc`, `cmake` and an installed FIDESlib (`$FIDESLIB_PREFIX`, default
-`env/fideslib`) exist; otherwise the runner prints `SKIP backend fideslib`. Memory for this
-backend is host peak RSS plus GPU memory in use. The emitted code has been syntax-checked
-against FIDESlib's real headers, but not compiled or run on a GPU.
-
-## 3. Adding a kernel
-
-Create `DSP_Kernels/<name>_fhe.py` (copy `fir_fhe.py`). It must define:
-
-| name | what |
-|---|---|
-| `SIZES` | list of input lengths to sweep |
-| `CASES` | optional dict of variants, e.g. `{"lowpass": dict(kind="lowpass")}`; each dict is passed as `**params` |
-| `TOL` | max absolute error allowed under CKKS |
-| `make_input(n)` | deterministic float input of length `n` (numpy array) |
-| `plaintext(x, **params)` | reference implementation. **Any library is fine here** (scipy, numpy, ...) |
-| `mlir(n, **params)` | returns the MLIR string for the encrypted kernel (build it with `mlir_builder.Kernel`) |
-
-Then run `python Scripts/run_kernel_test.py <name>`. No sweep script is needed; the
-runner does the sweep.
-
-### Writing the encrypted kernel with `Kernel`
-
-```python
-from mlir_builder import Kernel
-k = Kernel(n, "mykernel")        # one secret input vector of length n
-x = k.input
-r = k.rotate(x, 3)               # r[i] = x[(i+3) % n]  -- cyclic!
-t = k.mul_const(r, vec)          # ciphertext * public plaintext vector (length n or scalar)
-y = k.add(t, x)                  # also: sub, mul (ct*ct), add_const
-return k.build(y)
-```
-
-## 4. Restrictions on encrypted kernels
-
-- Only add, sub, multiply (ct×ct or ×public constant) and cyclic rotate. Anything else
-  (comparison, `abs`, `max`, division, `sqrt`, `if` on data) must become a polynomial
-  approximation, mirrored in `plaintext()`.
-- No library calls (`lfilter`, `np.convolve`, `np.fft`) on the secret input; constants that
-  don't depend on it (taps, twiddles) can be computed with libraries.
-- Rotation is cyclic: zero wrapped samples with a mask constant (see `fir_fhe.py`).
-- One secret input vector of `n` floats, one output of length `n`, float32 only.
-- Depth is chosen by HEIR with no bootstrapping; very deep kernels may fail, which is a
-  result worth reporting. Cost grows with rotations × `n`.
-
-## 5. Troubleshooting
-
-- `HEIR Error ... Signature parsing failed` / `UnboundLocalError: numba_ir`: the real
-  MLIR error is hidden. Dump your MLIR to a file and run
-  `env/venv/lib/python3.12/site-packages/heir/heir-opt --canonicalize --mlir-to-ckks file.mlir`.
-- `Python.h not found`: `source env/activate.sh` (sets `CPATH`).
-- `ccache: Read-only file system`: `export CCACHE_DISABLE=1` (set by `activate.sh`).
-
-## 6. Generating a kernel file with an AI model
-
-If a student has a plaintext Python implementation (numpy/scipy), an AI model can turn it
-into a `DSP_Kernels/<name>_fhe.py` for this runner. Paste the prompt below, then the
-student's file, into the model. Always run the result with
-`python Scripts/run_kernel_test.py <name> --sizes 128` and treat a FAIL as a bug in the
-generated file, not in the runner.
+A kernel is one file, `DSP_Kernels/<name>_fhe.py`; `fir_fhe.py` and `xcorr_fhe.py` are
+examples. To make one from plaintext numpy/scipy code, paste the prompt below into an AI
+model, followed by the plaintext file. Save its answer as `DSP_Kernels/<name>_fhe.py` and
+check it with `sbatch Scripts/run_sweep.sh <name> --sizes 128`. A FAIL means the generated
+file is wrong, not the runner.
 
 ````text
 You are converting a student's plaintext Python signal-processing code into a kernel spec
@@ -227,3 +143,72 @@ PROCEDURE:
    comment at the top of the file and implement the closest supported version, with the
    reference changed to match.
 ````
+
+## 3. Running the sweep
+
+```bash
+sbatch Scripts/run_sweep.sh              # fir and xcorr, ~10 min on one A30
+sbatch Scripts/run_sweep.sh <name>       # your kernel(s)
+```
+
+For every case and size in the kernel file, on all three libraries, the sweep computes the
+plaintext reference, compiles the kernel with HEIR, encrypts, evaluates, decrypts and checks
+the error. It writes `Results/<name>_results.csv`, replacing the previous one, and logs to
+`Results/sweep_<jobid>.log`. Each line of the log reads `PASS` or `FAIL`. The job exits
+non-zero on any FAIL, and it refuses to start if one of the libraries is missing.
+
+It runs as one GPU job. The defaults are Purdue Scholar's (`-A scholar -p gpu
+--gres=gpu:1 -C A30`); elsewhere use `sbatch -A <account> -p <gpu partition> ...`. Options
+after the kernel names go to the runner, e.g. `--sizes 128`.
+
+## 4. Results
+
+One row per (backend, case, n), where `backend` is `openfhe`, `lattigo` or `fideslib`:
+
+| column | meaning |
+|---|---|
+| `passed`, `fhe_max_err`, `tol` | PASS when the max absolute error of the decrypted output vs. the float64 plaintext result is <= the kernel's `TOL` |
+| `fhe_accuracy_pct`, `plain_accuracy_pct` | 100·(1 − ‖err‖/‖truth‖) for the encrypted and the float32 plaintext run |
+| `fhe_time_s` | time of the encrypted kernel evaluation only (including encoding its constant vectors). Compilation and key generation are excluded (paid once) |
+| `plain_time_s`, `slowdown` | plaintext time; slowdown = `fhe_time_s / plain_time_s` |
+| `encrypt_pct`, `decrypt_pct` | encryption / decryption time as a % of `fhe_time_s` + encrypt + decrypt |
+| `fhe_mem_mb`, `plain_mem_mb`, `mem_overhead_mb` | memory (MB) of the FHE run, of the plaintext run, and their difference |
+| `ops_total`, `op_<backend>_<Name>` | library operations executed by the kernel (rotations, multiplies, adds, rescales, plaintext encodes) |
+
+How to read them:
+
+- **Errors** are around 1e-7 for FIR and 1e-6 for xcorr on every backend, far below
+  `TOL = 1e-3`. HEIR chooses the CKKS parameters per library, so the errors differ
+  slightly. On the same input, FIDESlib and OpenFHE agree to about 4e-9.
+- **Time hardly depends on `n`** up to 1024. HEIR packs the input into one 1024-slot
+  ciphertext, so cost follows the number of operations (one rotation and multiply per FIR
+  tap), not the signal length.
+- **Memory is measured differently per backend**, so compare it within a backend, not across:
+  - OpenFHE: growth of the Python process.
+  - Lattigo: the whole Go process.
+  - FIDESlib: host peak memory plus GPU memory (about 1.1 GB of it is GPU memory, mostly
+    keys).
+
+  The first row of a sweep reads high because the library warms up then.
+- **`op_*` counts** show where the time goes; FIR uses 100 rotations and 101 multiplies.
+
+Reference sweep (Scholar, NVIDIA A30 GPU node with 8 CPU cores), ranges over all cases and
+sizes:
+
+| kernel | backend | fhe_time_s | slowdown | fhe_mem_mb | max error |
+|---|---|---|---|---|---|
+| fir | openfhe | 0.49–0.57 | 914–1030× | ~253 | 1.2e-7 |
+| fir | lattigo | 0.22 | 398–432× | ~137 | 2.8e-7 |
+| fir | fideslib | 0.071–0.079 | 133–151× | ~1368 | 1.2e-7 |
+| xcorr | openfhe | 0.36–0.37 | 1016–2123× | ~133 | 1.9e-6 |
+| xcorr | lattigo | 0.14 | 382–797× | ~93 | 3.7e-6 |
+| xcorr | fideslib | 0.042–0.047 | 129–262× | ~1330 | 1.9e-6 |
+
+## Troubleshooting
+
+- `HEIR Error ... Signature parsing failed`: the real MLIR error is hidden. Write
+  `mlir(n)`'s output to `file.mlir` and run
+  `env/venv/lib/python3.12/site-packages/heir/heir-opt --canonicalize --mlir-to-ckks file.mlir`.
+- Running the runner by hand (on a compute node): `source env/activate.sh`, then
+  `env/venv/bin/python Scripts/run_kernel_test.py <name> --backends openfhe --sizes 128`.
+  `--emit-fideslib DIR` writes the generated GPU C++ without needing a GPU.

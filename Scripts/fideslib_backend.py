@@ -22,20 +22,39 @@ import fideslib_emitter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEIR_DIR = os.path.join(ROOT, "env", "venv", "lib", "python3.12", "site-packages", "heir")
-# Install prefix of FIDESlib (contains lib/cmake/fideslib). Override with $FIDESLIB_PREFIX.
+# Install prefix of FIDESlib (contains share/fideslib/cmake). Override with $FIDESLIB_PREFIX.
 PREFIX = os.environ.get("FIDESLIB_PREFIX", os.path.join(ROOT, "env", "fideslib"))
+# FIDESlib's own patched OpenFHE 1.6.1 (linked statically into the kernel; never env/openfhe).
+OPENFHE_PREFIX = os.environ.get("FIDESLIB_OPENFHE_PREFIX", os.path.join(PREFIX, "openfhe"))
 
+# fideslib::fideslib carries the static fideslib.a, the patched OpenFHE archives and the CUDA
+# runtime, but not the OpenFHE include dirs its public headers need (constants-defs.h, ...).
 CMAKE = """cmake_minimum_required(VERSION 3.25.2)
 set(CMAKE_CXX_STANDARD 20)
 project(kernel LANGUAGES CXX)
 find_package(fideslib REQUIRED CONFIG)
-set(CMAKE_CXX_COMPILER ${FIDESLIB_CXX_COMPILER})
+find_package(OpenFHE 1.6.1 EXACT REQUIRED CONFIG PATHS ${FIDESLIB_OPENFHE_PREFIX} NO_DEFAULT_PATH)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FIDESLIB_CXX_FLAGS}")
 add_executable(kernel kernel.cpp)
-target_include_directories(kernel PRIVATE ${FIDESLIB_INCLUDE_PATH})
-target_link_directories(kernel PRIVATE ${FIDESLIB_LIBRARIES_PATH})
-target_link_libraries(kernel PRIVATE ${FIDESLIB_LIBRARIES})
+target_include_directories(kernel PRIVATE ${OpenFHE_INCLUDE} ${OpenFHE_INCLUDE}/third-party/include
+                           ${OpenFHE_INCLUDE}/core ${OpenFHE_INCLUDE}/pke ${OpenFHE_INCLUDE}/binfhe)
+target_link_libraries(kernel PRIVATE fideslib::fideslib CUDA::cudart)   # cudart for its headers
+# RPATH, not RUNPATH: the CUDA runtime found at build time must win over LD_LIBRARY_PATH
+# (which may carry another libcudart, e.g. a GPGPU-Sim one).
+target_link_options(kernel PRIVATE -Wl,--disable-new-dtags)
 """
+
+
+def _fideslib_cxx():
+    """The C++ compiler FIDESlib was built with (fideslib.a has LTO objects, so the kernel must
+    use the same one). It has to be set before project(), hence on the cmake command line."""
+    for dirpath, _, files in os.walk(PREFIX):
+        if "fideslibConfig.cmake" in files:
+            txt = open(os.path.join(dirpath, "fideslibConfig.cmake")).read()
+            m = re.search(r'set\(FIDESLIB_CXX_COMPILER "([^"]+)"\)', txt)
+            if m:
+                return shutil.which(m.group(1)) or m.group(1)
+    return None
 
 
 def available():
@@ -75,8 +94,10 @@ def run_fideslib(mlir_str, x):
         src = emit_source(mlir_str)
         open(os.path.join(work, "kernel.cpp"), "w").write(src)
         open(os.path.join(work, "CMakeLists.txt"), "w").write(CMAKE)
+        cxx = _fideslib_cxx()
         _run(["cmake", "-S", work, "-B", os.path.join(work, "build"),
-              f"-DCMAKE_PREFIX_PATH={PREFIX}", "-DCMAKE_BUILD_TYPE=Release"])
+              f"-DCMAKE_PREFIX_PATH={PREFIX}", f"-DFIDESLIB_OPENFHE_PREFIX={OPENFHE_PREFIX}",
+              "-DCMAKE_BUILD_TYPE=Release"] + ([f"-DCMAKE_CXX_COMPILER={cxx}"] if cxx else []))
         _run(["cmake", "--build", os.path.join(work, "build"), "-j"])
         t_compile = time.perf_counter() - t0
 

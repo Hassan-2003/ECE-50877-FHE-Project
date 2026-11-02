@@ -51,7 +51,7 @@ def fideslib_methods():
 
 DRIVER = r"""
 // ---------------------------------------------------------------- driver (emitted)
-#if __has_include(<cuda_runtime.h>)
+// Required: without it the timings would miss the syncs and GPU memory would read 0.
 #include <cuda_runtime.h>
 #define FIDES_SYNC() cudaDeviceSynchronize()
 static size_t gpu_used_bytes() {
@@ -59,10 +59,6 @@ static size_t gpu_used_bytes() {
   cudaMemGetInfo(&free_b, &total_b);
   return total_b - free_b;
 }
-#else
-#define FIDES_SYNC() ((void)0)
-static size_t gpu_used_bytes() { return 0; }
-#endif
 #include <chrono>
 
 static long peak_rss_bytes() {
@@ -146,15 +142,33 @@ def emit_fideslib(openfhe_cpp, func="kernel"):
     for old, new in RENAMES.items():
         src = re.sub(rf"\bcc->{old}\(", f"cc->{new}(", src)
 
+    # FIXEDMANUAL (below) encodes fresh plaintexts at 2^scaleModSize. A vector whose entries
+    # are all below one unit at that scale (FIR edge taps of ~1e-18) makes OpenFHE's encoder
+    # throw "Scaling factor too small"; such entries round to 0 anyway, so encode them as 0.
+    src = src.replace("using namespace fideslib;", "using namespace fideslib;\n"
+                      "static void fides_flush_tiny(std::vector<double>& v) {\n"
+                      "  for (auto& x : v) if (std::abs(x) < 1e-15) x = 0.0;\n}", 1)
+    src = re.sub(r"^([ \t]*)(.*= cc->MakeCKKSPackedPlaintext\((\w+)\);)",
+                 r"\1fides_flush_tiny(\3);\n\1\2", src, flags=re.M)
+
     # Decrypt takes a non-const Ciphertext&: copy instead of binding const refs.
     def fix_decrypt(m):
         return m.group(0).replace("const auto& ", "auto ")
     src = re.sub(rf"std::vector<float> {func}__decrypt__result\d+\(.*?\n}}\n", fix_decrypt,
                  src, flags=re.S)
 
-    # GPU parameters on the generated crypto context.
+    # HEIR's OpenFHE loops (e.g. hoisted rotations) are OpenMP-parallel on the CPU; on the
+    # GPU every iteration would share one device context and lazily load the same input
+    # ciphertext, so run them sequentially (the GPU parallelizes inside each op).
+    src = re.sub(r"[ \t]*#pragma omp parallel for.*\n", "", src)
+
+    # GPU parameters on the generated crypto context. HEIR emits explicit ModReduce calls
+    # and sets no scaling technique: OpenFHE's default FLEXIBLEAUTOEXT turns those into
+    # no-ops, but FIDESlib's RescaleInPlace always rescales, so use the manual technique the
+    # explicit schedule is written for.
     src = re.sub(r"(CCParamsT params;\n)",
                  r"\1  params.SetDevices({0});\n  params.SetPlaintextAutoload(true);\n"
-                 r"  params.SetCiphertextAutoload(true);\n", src, count=1)
+                 r"  params.SetCiphertextAutoload(true);\n"
+                 r"  params.SetScalingTechnique(FIXEDMANUAL);\n", src, count=1)
 
     return src + DRIVER.replace("KERNEL", func)
