@@ -13,6 +13,11 @@ How primitives are counted: the C++ HEIR generates is rewritten before compilati
 each `cc->EvalXxx(...)`/`ModReduce`/`Encrypt`/... call first bumps a counter. The
 counters are reset right before the kernel runs and read right after, so loops and
 hoisted rotations are counted as actually executed.
+
+How time is measured: every backend runs the encrypted kernel once untimed (warm-up), then
+--repeats times (default 10); fhe_time_s is the median and fhe_time_std_s the standard
+deviation. The plaintext reference takes only microseconds, so it is timed like `timeit`:
+batches of many calls, 7 batches, median per-call time. slowdown = median / median.
 """
 import argparse
 import csv
@@ -126,7 +131,7 @@ class PeakRSS:
 _COUNTER = 0
 
 
-def run_fhe(mlir_str, x):
+def run_fhe(mlir_str, x, repeats=1):
     """Compile, then setup/encrypt/eval/decrypt. Returns (y, timings, op_counts, mem)."""
     # HEIR names the compiled module after the function; reusing a name in one
     # process silently returns the first module. Make each name unique.
@@ -149,17 +154,42 @@ def run_fhe(mlir_str, x):
         ct = fn.encrypt_arg_0([float(v) for v in x])
         t_enc = time.perf_counter() - t0
 
-        reset_counts(so_path)
-        t0 = time.perf_counter()
-        out = fn.eval(ct)
-        t_eval = time.perf_counter() - t0
+        out = fn.eval(ct)                      # warm-up, untimed
+        t_eval = []
+        for r in range(repeats):
+            if r == repeats - 1:
+                reset_counts(so_path)          # count the ops of one run only
+            t0 = time.perf_counter()
+            out = fn.eval(ct)
+            t_eval.append(time.perf_counter() - t0)
         counts = read_counts(so_path)
 
     t0 = time.perf_counter()
     y = np.array(fn.decrypt_result(out), dtype=float).ravel()[:len(x)]
     t_dec = time.perf_counter() - t0
-    return y, dict(fhe_time_s=t_eval, compile_s=t_compile, setup_s=t_setup,
+    return y, dict(eval_s=t_eval, compile_s=t_compile, setup_s=t_setup,
                    encrypt_s=t_enc, decrypt_s=t_dec), counts, mem.delta
+
+
+def time_plain(f, x, batches=7, min_batch_s=0.02):
+    """Median per-call time of f(x), timeit-style: grow the batch until one batch takes at
+    least min_batch_s (so timer resolution and one-off noise do not matter), then time
+    `batches` batches."""
+    number = 1
+    while True:
+        t0 = time.perf_counter()
+        for _ in range(number):
+            f(x)
+        if time.perf_counter() - t0 >= min_batch_s:
+            break
+        number *= 2
+    per_call = []
+    for _ in range(batches):
+        t0 = time.perf_counter()
+        for _ in range(number):
+            f(x)
+        per_call.append((time.perf_counter() - t0) / number)
+    return float(np.median(per_call))
 
 
 def accuracy_pct(y, ref):
@@ -173,10 +203,15 @@ def main():
     ap.add_argument("--backends", nargs="+", choices=["openfhe", "lattigo", "fideslib"],
                     default=["openfhe", "lattigo", "fideslib"],
                     help="FHE libraries to run (default: all; unavailable ones are skipped)")
+    ap.add_argument("--repeats", type=int, default=10,
+                    help="timed runs of the encrypted kernel after one warm-up run; "
+                         "fhe_time_s is their median (default: 10)")
     ap.add_argument("--emit-fideslib", metavar="DIR",
                     help="only write the generated FIDESlib C++ for every case/size to DIR "
                          "(no GPU needed) and exit")
     args = ap.parse_args()
+    if args.repeats < 1:
+        ap.error("--repeats must be >= 1")
 
     if args.emit_fideslib:
         os.makedirs(args.emit_fideslib, exist_ok=True)
@@ -209,21 +244,23 @@ def main():
                 x = mod.make_input(n)
                 truth = np.asarray(mod.plaintext(x, **params), dtype=np.float64)
 
-                # Plaintext run: float32 like the FHE kernel's precision, timed and
-                # memory-profiled; its accuracy is measured against the float64 truth.
+                # Plaintext run: float32 like the FHE kernel's precision; its accuracy is
+                # measured against the float64 truth. Memory comes from one traced call,
+                # time from untraced repeated calls (tracemalloc slows Python code down).
                 x32 = x.astype(np.float32)
                 tracemalloc.start()
-                t0 = time.perf_counter()
                 y_plain = np.asarray(mod.plaintext(x32, **params)).astype(np.float32)
-                t_plain = time.perf_counter() - t0
                 plain_mem = tracemalloc.get_traced_memory()[1]
                 tracemalloc.stop()
+                t_plain = time_plain(lambda v: mod.plaintext(v, **params), x32)
 
                 for backend in backends:
                     total += 1
                     tag = f"{kname}/{case} n={n} [{backend}]"
                     try:
-                        y, tm, counts, fhe_mem = runners[backend](mod.mlir(n, **params), x)
+                        y, tm, counts, fhe_mem = runners[backend](mod.mlir(n, **params), x,
+                                                                  args.repeats)
+                        tm["fhe_time_s"] = float(np.median(tm["eval_s"]))
                     except BaseException as e:   # heir may SystemExit on compile errors
                         print(f"FAIL {tag}: {e!r}")
                         failures += 1
@@ -236,6 +273,7 @@ def main():
                     rows.append(dict(
                         kernel=kname, backend=backend, case=case, n=n,
                         plain_time_s=t_plain, fhe_time_s=tm["fhe_time_s"],
+                        fhe_time_std_s=float(np.std(tm["eval_s"])), repeats=args.repeats,
                         slowdown=tm["fhe_time_s"] / t_plain if t_plain else float("nan"),
                         encrypt_pct=100 * tm["encrypt_s"] / t_total,
                         decrypt_pct=100 * tm["decrypt_s"] / t_total,
@@ -249,7 +287,8 @@ def main():
                         _counts={f"{backend}_{k}": v for k, v in counts.items()}))
                     r = rows[-1]
                     print(f"{'PASS' if ok else 'FAIL'} {tag}: "
-                          f"plain {t_plain*1e3:.3f} ms, fhe {tm['fhe_time_s']:.3f} s, "
+                          f"plain {t_plain*1e3:.3f} ms, fhe {tm['fhe_time_s']:.3f} "
+                          f"± {r['fhe_time_std_s']:.3f} s, "
                           f"slowdown {r['slowdown']:.0f}x, "
                           f"acc plain/fhe {r['plain_accuracy_pct']:.4f}/"
                           f"{r['fhe_accuracy_pct']:.4f}%, err {err:.2e} (tol {mod.TOL}), "

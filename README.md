@@ -169,8 +169,8 @@ One row per (backend, case, n), where `backend` is `openfhe`, `lattigo` or `fide
 |---|---|
 | `passed`, `fhe_max_err`, `tol` | PASS when the max absolute error of the decrypted output vs. the float64 plaintext result is <= the kernel's `TOL` |
 | `fhe_accuracy_pct`, `plain_accuracy_pct` | 100·(1 − ‖err‖/‖truth‖) for the encrypted and the float32 plaintext run |
-| `fhe_time_s` | time of the encrypted kernel evaluation only (including encoding its constant vectors). Compilation and key generation are excluded (paid once) |
-| `plain_time_s`, `slowdown` | plaintext time; slowdown = `fhe_time_s / plain_time_s` |
+| `fhe_time_s`, `fhe_time_std_s`, `repeats` | median and standard deviation over `repeats` timed runs (after one untimed warm-up run; `--repeats`, default 10) of the encrypted kernel evaluation only (including encoding its constant vectors). Compilation and key generation are excluded (paid once) |
+| `plain_time_s`, `slowdown` | median plaintext time per call, timed like `timeit` (7 batches of many calls); slowdown = `fhe_time_s / plain_time_s` |
 | `encrypt_pct`, `decrypt_pct` | encryption / decryption time as a % of `fhe_time_s` + encrypt + decrypt |
 | `fhe_mem_mb`, `plain_mem_mb`, `mem_overhead_mb` | memory (MB) of the FHE run, of the plaintext run, and their difference |
 | `ops_total`, `op_<backend>_<Name>` | library operations executed by the kernel (rotations, multiplies, adds, rescales, plaintext encodes) |
@@ -193,7 +193,7 @@ How to read them:
 - **`op_*` counts** show where the time goes; FIR uses 100 rotations and 101 multiplies.
 
 Reference sweep (Scholar, NVIDIA A30 GPU node with 8 CPU cores), ranges over all cases and
-sizes:
+sizes. These numbers are single runs, measured before repeated timing was added:
 
 | kernel | backend | fhe_time_s | slowdown | fhe_mem_mb | max error |
 |---|---|---|---|---|---|

@@ -74,7 +74,8 @@ int main(int argc, char** argv) {
   auto secs = [](clk::time_point a) {
     return std::chrono::duration<double>(clk::now() - a).count();
   };
-  if (argc < 2) { std::cerr << "usage: " << argv[0] << " input.txt\n"; return 2; }
+  if (argc < 2) { std::cerr << "usage: " << argv[0] << " input.txt [repeats]\n"; return 2; }
+  int repeats = argc > 2 ? std::atoi(argv[2]) : 1;
   std::ifstream in(argv[1]);
   size_t n = 0;
   in >> n;
@@ -96,10 +97,17 @@ int main(int argc, char** argv) {
   FIDES_SYNC();
   double t_enc = secs(t0);
 
-  t0 = clk::now();
+  // One untimed warm-up run (first-call GPU / allocator costs), then `repeats` timed runs.
+  // The kernel takes the input as const, so every run sees the same ciphertext.
   auto out = KERNEL(cc, ct);
   FIDES_SYNC();
-  double t_eval = secs(t0);
+  std::vector<double> t_eval;
+  for (int r = 0; r < repeats; ++r) {
+    t0 = clk::now();
+    out = KERNEL(cc, ct);
+    FIDES_SYNC();
+    t_eval.push_back(secs(t0));
+  }
 
   t0 = clk::now();
   auto y = KERNEL__decrypt__result0(cc, out, keys.secretKey);
@@ -107,8 +115,9 @@ int main(int argc, char** argv) {
   double t_dec = secs(t0);
 
   std::cout.precision(9);
-  std::cout << "setup_s=" << t_setup << "\nencrypt_s=" << t_enc << "\nfhe_time_s=" << t_eval
-            << "\ndecrypt_s=" << t_dec << "\npeak_rss=" << peak_rss_bytes()
+  std::cout << "setup_s=" << t_setup << "\nencrypt_s=" << t_enc << "\neval_s=";
+  for (double t : t_eval) std::cout << t << " ";
+  std::cout << "\ndecrypt_s=" << t_dec << "\npeak_rss=" << peak_rss_bytes()
             << "\ngpu_bytes=" << (gpu_used_bytes() - gpu0) << "\ny=";
   for (float v : y) std::cout << v << " ";
   std::cout << "\n";

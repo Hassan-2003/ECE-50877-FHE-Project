@@ -36,6 +36,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 )
 
 func peakRSS() int64 {
@@ -51,7 +53,10 @@ func peakRSS() int64 {
 }
 
 func main() {
-	var in struct{ X []float32 }
+	var in struct {
+		X []float32
+		R int
+	}
 	if err := json.NewDecoder(os.Stdin).Decode(&in); err != nil {
 		panic(err)
 	}
@@ -63,16 +68,30 @@ func main() {
 	ct := Kernel__encrypt__arg0(ev, param, enc, encryptor, in.X)
 	tEnc := time.Since(t0).Seconds()
 
-	t0 = time.Now()
-	out := Kernel(ev, param, enc, ct)
-	tEval := time.Since(t0).Seconds()
+	// One untimed warm-up run, then in.R timed runs, each on a fresh copy of the input
+	// ciphertext (copied outside the timer) so in-place ops cannot change later runs.
+	fresh := func() []*rlwe.Ciphertext {
+		c := make([]*rlwe.Ciphertext, len(ct))
+		for i, v := range ct {
+			c[i] = v.CopyNew()
+		}
+		return c
+	}
+	out := Kernel(ev, param, enc, fresh())
+	tEval := []float64{}
+	for r := 0; r < in.R; r++ {
+		cin := fresh()
+		t0 = time.Now()
+		out = Kernel(ev, param, enc, cin)
+		tEval = append(tEval, time.Since(t0).Seconds())
+	}
 
 	t0 = time.Now()
 	y := Kernel__decrypt__result0(ev, param, enc, decryptor, out)
 	tDec := time.Since(t0).Seconds()
 
 	json.NewEncoder(os.Stdout).Encode(map[string]any{
-		"y": y, "setup_s": setup, "encrypt_s": tEnc, "fhe_time_s": tEval,
+		"y": y, "setup_s": setup, "encrypt_s": tEnc, "eval_s": tEval,
 		"decrypt_s": tDec, "peak_rss": peakRSS()})
 }
 """
@@ -105,7 +124,7 @@ def _count_ops(go_src):
     return counts
 
 
-def run_lattigo(mlir_str, x):
+def run_lattigo(mlir_str, x, repeats=1):
     """Same contract as run_fhe: (y, timings, op_counts, peak_rss_bytes)."""
     mlir_str = re.sub(r"func\.func @\w+", "func.func @kernel", mlir_str, count=1)
     work = tempfile.mkdtemp(prefix="lattigo_")
@@ -128,10 +147,10 @@ def run_lattigo(mlir_str, x):
         t_compile = time.perf_counter() - t0
 
         out = _run([os.path.join(work, "kernel_bin")], cwd=work, env=env,
-                   input=json.dumps({"X": [float(v) for v in x]}))
+                   input=json.dumps({"X": [float(v) for v in x], "R": repeats}))
         res = json.loads(out)
         y = np.array(res["y"], dtype=float).ravel()[:len(x)]
-        tm = dict(fhe_time_s=res["fhe_time_s"], compile_s=t_compile, setup_s=res["setup_s"],
+        tm = dict(eval_s=res["eval_s"], compile_s=t_compile, setup_s=res["setup_s"],
                   encrypt_s=res["encrypt_s"], decrypt_s=res["decrypt_s"])
         return y, tm, _count_ops(go_src), int(res["peak_rss"])
     finally:

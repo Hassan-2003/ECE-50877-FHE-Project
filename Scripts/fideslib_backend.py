@@ -86,7 +86,7 @@ def emit_source(mlir_str):
     return fideslib_emitter.emit_fideslib(cpp, "kernel")
 
 
-def run_fideslib(mlir_str, x):
+def run_fideslib(mlir_str, x, repeats=1):
     """Same contract as run_fhe: (y, timings, op_counts, mem_bytes)."""
     work = tempfile.mkdtemp(prefix="fideslib_")
     try:
@@ -104,10 +104,10 @@ def run_fideslib(mlir_str, x):
         inp = os.path.join(work, "in.txt")
         with open(inp, "w") as fh:
             fh.write(f"{len(x)}\n" + " ".join(repr(float(v)) for v in x) + "\n")
-        out = _run([os.path.join(work, "build", "kernel"), inp])
+        out = _run([os.path.join(work, "build", "kernel"), inp, str(repeats)])
         res = dict(line.split("=", 1) for line in out.strip().splitlines() if "=" in line)
         y = np.array([float(v) for v in res["y"].split()], dtype=float)[:len(x)]
-        tm = dict(fhe_time_s=float(res["fhe_time_s"]), compile_s=t_compile,
+        tm = dict(eval_s=[float(t) for t in res["eval_s"].split()], compile_s=t_compile,
                   setup_s=float(res["setup_s"]), encrypt_s=float(res["encrypt_s"]),
                   decrypt_s=float(res["decrypt_s"]))
         counts = _count_ops(src)
