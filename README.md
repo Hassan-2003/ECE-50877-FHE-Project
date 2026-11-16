@@ -1,6 +1,6 @@
 # ECE-50877-FHE-Project
 
-CKKS (homomorphic encryption) versions of DSP kernels (FIR, cross-correlation, ...),
+CKKS (homomorphic encryption) versions of DSP kernels (FIR, cross-correlation, FFT, SURF and HOG),
 compiled with [HEIR](https://github.com/google/heir) to three libraries (OpenFHE and
 Lattigo on the CPU, FIDESlib on an NVIDIA GPU) and compared against plaintext Python.
 See `FHE_Applied_Signal_Processing_Research_Plan.pdf`.
@@ -160,6 +160,58 @@ non-zero on any FAIL, and it refuses to start if one of the libraries is missing
 It runs as one GPU job. The defaults are Purdue Scholar's (`-A scholar -p gpu
 --gres=gpu:1 -C A30`); elsewhere use `sbatch -A <account> -p <gpu partition> ...`. Options
 after the kernel names go to the runner, e.g. `--sizes 128`.
+
+### FFT, SURF and HOG use the same runner
+
+Each algorithm has a plaintext module and a matching `<name>_fhe.py` specification,
+as in `fft.py` / `fft_fhe.py`. All use the same cases, backend selection and
+`Results/<name>_results.csv` format:
+
+```bash
+sbatch Scripts/run_sweep.sh fft surf hog --sizes 256
+# Or inside the configured environment:
+python Scripts/run_kernel_test.py fft surf hog --sizes 256 --backends openfhe lattigo fideslib
+```
+
+SURF and HOG accept a row-major 16×16 grayscale image with intensities in [0,1].
+Their seeded blob/square/noise image is identical across backends and algorithms.
+
+| Kernel | Cases and output |
+|---|---|
+| SURF | Determinant and trace maps at sizes 9, 15 and 21; 256 row-major responses |
+| HOG | Horizontal/vertical gradients, squared magnitude, polynomial histogram and descriptor |
+| HOG descriptor layout | Four 8×8 cells × nine unsigned bins in slots 0:36; the remaining slots are zero |
+
+SURF follows [Bay et al., Section 3](https://doi.org/10.1007/11744023_32) for the
+box Hessian and [Shortell and Shokoufandeh, Section 5](https://doi.org/10.1049/iet-ifs.2019.0157)
+for computing responses before decryption and comparing keypoints afterward.
+Zero padding is used at image edges; size 21 therefore uses padding everywhere
+on this small image. Candidate detection omits subpixel interpolation, further
+octaves, orientation assignment and SURF descriptors.
+
+HOG follows [Dalal and Triggs, Sections 6.2–6.4](https://doi.org/10.1109/CVPR.2005.177)
+for gradients, orientation cells and normalization. Undefined normal derivatives
+are zero at the image boundary. Our encrypted variant replaces magnitude/angle
+voting with `(8/27)*mean(((gx*cos(theta)+gy*sin(theta))/2)^4)` per cell and bin.
+It uses hard cells, regularized L2 normalization with epsilon=0.25 and a quadratic
+inverse-square-root approximation; it omits spatial interpolation and L2-Hys
+clipping. For [0,1] images, the squared histogram norm is at most 35/648, and the
+normalization polynomial's relative error is below 0.98% on that domain.
+
+`hog.classical_descriptor()` retains exact voting, spatial interpolation and
+L2-Hys for comparison. Run `python DSP_Kernels/hog.py` to see algorithm and
+normalization errors separately; the histogram/descriptor differences from
+classical HOG are about 0.0111/0.228 on the fixed image. The runner's
+`fhe_max_err` instead measures numerical error against the matching polynomial
+reference. A CKKS PASS does not imply equivalence to full classical HOG.
+Gamma correction, Gaussian block weighting and classification are omitted.
+
+The runner and backend adapters are unchanged. The FIDESlib emitter additionally
+maps adjacent multiply/relinearize pairs and level drops for SURF/HOG.
+The SURF/HOG result files currently contain local Lattigo CPU measurements only.
+Memory is not measured on macOS because the existing driver reads Linux `/proc`.
+OpenFHE/FIDESlib execution
+and comparable memory measurements require the configured Linux GPU node.
 
 ## 4. Results
 

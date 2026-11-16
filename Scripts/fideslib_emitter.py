@@ -9,6 +9,8 @@ OpenFHE code"):
   * includes / namespace:  openfhe.h + lbcrypto  ->  <fideslib.hpp> + fideslib
     (EvalKey / ConstCiphertext aliases, which FIDESlib lacks, are dropped or inlined)
   * cc->ModReduce*(...)    ->  cc->Rescale*(...)     (FIDESlib's name for the same op)
+  * adjacent EvalMultNoRelin / RelinearizeInPlace -> EvalMult (which relinearizes)
+  * LevelReduceInPlace(ct, nullptr, n) -> SetLevel(ct, ct->GetLevel() + n)
   * ring dimension query   ->  cc->GetRingDimension()  (no GetCryptoParameters())
   * decrypt inputs are non-const (FIDESlib Decrypt takes Ciphertext&)
   * GPU setup in the generated crypto context: SetDevices, plaintext/ciphertext autoload
@@ -26,13 +28,14 @@ import re
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIDES_API = os.path.join(ROOT, "env", "src", "FIDESlib", "api", "CryptoContext.hpp")
 
-# Used when the FIDESlib sources are not checked out (matches FIDESlib 2.2.0).
+# SetLevel drops modulus towers without rescaling; see FIDESlib api/Ciphertext.cpp.
 FALLBACK_METHODS = {
     "Enable", "GetRingDimension", "KeyGen", "EvalMultKeyGen", "EvalRotateKeyGen",
     "MakeCKKSPackedPlaintext", "Encrypt", "Decrypt", "EvalAdd", "EvalAddInPlace",
     "EvalAddMutable", "EvalSub", "EvalSubInPlace", "EvalMult", "EvalMultInPlace",
     "EvalMultMutable", "EvalRotate", "EvalRotateInPlace", "EvalFastRotationPrecompute",
     "EvalFastRotation", "EvalFastRotationExt", "Rescale", "RescaleInPlace", "LoadContext",
+    "SetLevel",
 }
 
 # OpenFHE name -> FIDESlib name
@@ -46,7 +49,19 @@ class UnsupportedPrimitive(Exception):
 def fideslib_methods():
     if not os.path.exists(FIDES_API):
         return FALLBACK_METHODS
-    return set(re.findall(r"\b(\w+)\(", open(FIDES_API).read())) | FALLBACK_METHODS
+    # Installed declarations take precedence over the fallback API catalog.
+    with open(FIDES_API) as stream:
+        return set(re.findall(r"\b(\w+)\s*\(", stream.read()))
+
+
+def _rewrite_management(src):
+    # FIDESlib EvalMult includes relinearization; only adjacent matching pairs are fused.
+    pattern = (r"^([ \t]*)auto (\w+) = cc->EvalMultNoRelin\(([^;\n]+)\);"
+               r"[ \t]*\n[ \t]*cc->RelinearizeInPlace\(\2\);")
+    src = re.sub(pattern, r"\1auto \2 = cc->EvalMult(\3);", src, flags=re.M)
+    src = re.sub(r"\bcc->LevelReduceInPlace\((\w+),\s*nullptr,\s*(\d+)\)",
+                 r"cc->SetLevel(\1, \1->GetLevel() + \2)", src)
+    return src
 
 
 DRIVER = r"""
@@ -119,7 +134,7 @@ int main(int argc, char** argv) {
 
 def emit_fideslib(openfhe_cpp, func="kernel"):
     """OpenFHE C++ from HEIR (entry function `func`) -> complete FIDESlib program source."""
-    src = openfhe_cpp.replace(
+    src = _rewrite_management(openfhe_cpp).replace(
         "cc->GetCryptoParameters()->GetElementParams()->GetRingDimension()",
         "cc->GetRingDimension()")
 
